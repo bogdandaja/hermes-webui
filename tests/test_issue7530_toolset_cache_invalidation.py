@@ -6,6 +6,7 @@ import collections
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
@@ -44,7 +45,7 @@ def test_toolset_change_fails_closed_when_system_prompt_invalidation_fails(tmp_p
         with (
             patch("api.routes.get_session", return_value=session),
             patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
-            patch("hermes_state.SessionDB", return_value=db),
+            patch.dict(sys.modules, {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))}),
         ):
             handler = _DummyHandler({
                 "session_id": session.session_id,
@@ -93,7 +94,7 @@ def test_toolset_change_fails_closed_when_tool_names_invalidation_fails(tmp_path
                 "api.routes._active_state_db_path",
                 return_value=tmp_path / "state.db",
             ),
-            patch("hermes_state.SessionDB", return_value=db),
+            patch.dict(sys.modules, {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))}),
         ):
             handler = _DummyHandler({
                 "session_id": session.session_id,
@@ -145,7 +146,7 @@ def test_toolset_change_invalidates_both_caches_before_saving_override(tmp_path)
                 "api.routes._active_state_db_path",
                 return_value=tmp_path / "state.db",
             ),
-            patch("hermes_state.SessionDB", return_value=db),
+            patch.dict(sys.modules, {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))}),
         ):
             handler = _DummyHandler({
                 "session_id": session.session_id,
