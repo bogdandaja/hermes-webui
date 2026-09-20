@@ -15951,6 +15951,25 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(sid):
+            # A no-op must not evict Agent caches or rewrite the sidecar.
+            if s.enabled_toolsets == toolsets:
+                return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
+
+            # A live or unwinding worker can restore the old Agent pins after
+            # this route returns. Reject the change instead of reporting a
+            # success that the next turn would silently undo.
+            if (
+                _active_stream_blocks_chat_start(
+                    s, getattr(s, "active_stream_id", None)
+                )
+                or _active_run_stream_for_session(sid)
+            ):
+                return bad(
+                    handler,
+                    "Cannot change session toolsets during an active turn",
+                    409,
+                )
+
             # Invalidate Hermes' persisted Agent cache pins before making the
             # new WebUI toolset override durable. This keeps failures fail-closed:
             # the old toolset remains authoritative until both invalidations
@@ -15964,8 +15983,16 @@ def handle_post(handler, parsed) -> bool:
             finally:
                 _state_db.close()
 
-            s.enabled_toolsets = toolsets
-            s.save()
+            previous_toolsets = s.enabled_toolsets
+            try:
+                s.enabled_toolsets = toolsets
+                s.save()
+            except Exception:
+                # Session is shared through models.SESSIONS. Do not leave the
+                # in-memory object ahead of the durable sidecar after a failed
+                # atomic replace.
+                s.enabled_toolsets = previous_toolsets
+                raise
 
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
 
