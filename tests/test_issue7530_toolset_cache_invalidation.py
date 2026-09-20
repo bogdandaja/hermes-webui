@@ -174,6 +174,191 @@ def test_toolset_change_invalidates_both_caches_before_saving_override(tmp_path)
         db.close.assert_called_once()
 
 
+
+def test_toolset_change_restores_shared_session_when_sidecar_save_fails(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+        sidecar = session_dir / f"{sid}.json"
+
+        calls = []
+        db = Mock()
+        db.update_system_prompt.side_effect = (
+            lambda session_id, value: calls.append(("system_prompt", session_id, value))
+        )
+        db.update_session_tool_names.side_effect = (
+            lambda session_id, value: calls.append(("tool_names", session_id, value))
+        )
+        real_safe_replace = models._safe_replace
+
+        def fail_session_sidecar(src, dst):
+            if Path(dst) == sidecar:
+                raise OSError("session sidecar replace failed")
+            return real_safe_replace(src, dst)
+
+        with (
+            patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
+            patch.object(models, "_safe_replace", side_effect=fail_session_sidecar),
+            patch.dict(
+                sys.modules,
+                {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))},
+            ),
+        ):
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["new-toolset"],
+            })
+
+            with pytest.raises(OSError, match="session sidecar replace failed"):
+                handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert json.loads(sidecar.read_text())["enabled_toolsets"] == ["old-toolset"]
+        assert models.SESSIONS[sid].enabled_toolsets == ["old-toolset"]
+        assert models.get_session(sid).enabled_toolsets == ["old-toolset"]
+        assert handler.status != 200
+        assert calls == [
+            ("system_prompt", sid, None),
+            ("tool_names", sid, None),
+        ]
+        db.close.assert_called_once()
+
+        session.title = "Unrelated later save"
+        session.save(skip_index=True)
+        assert json.loads(sidecar.read_text())["enabled_toolsets"] == ["old-toolset"]
+
+
+def test_toolset_change_is_rejected_during_active_turn(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+
+        with (
+            patch(
+                "api.routes._active_stream_blocks_chat_start",
+                return_value=True,
+            ),
+            patch(
+                "api.routes._active_run_stream_for_session",
+                side_effect=AssertionError("run probe must not be needed"),
+            ),
+        ):
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["new-toolset"],
+            })
+            handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert handler.status == 409
+        assert json.loads(
+            (session_dir / f"{sid}.json").read_text()
+        )["enabled_toolsets"] == ["old-toolset"]
+
+
+def test_toolset_change_is_rejected_during_active_run_unwind(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+
+        with (
+            patch(
+                "api.routes._active_stream_blocks_chat_start",
+                return_value=False,
+            ),
+            patch(
+                "api.routes._active_run_stream_for_session",
+                return_value="unwinding-stream",
+            ),
+        ):
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["new-toolset"],
+            })
+            handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert handler.status == 409
+        assert json.loads(
+            (session_dir / f"{sid}.json").read_text()
+        )["enabled_toolsets"] == ["old-toolset"]
+
+
+def test_identical_toolset_selection_is_a_noop(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+
+        with (
+            patch.object(session, "save") as save_mock,
+            patch(
+                "api.routes._active_stream_blocks_chat_start",
+                side_effect=AssertionError("no-op must return before active checks"),
+            ),
+            patch(
+                "api.routes._active_state_db_path",
+                side_effect=AssertionError("no-op must not open SessionDB"),
+            ),
+        ):
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["old-toolset"],
+            })
+            handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert handler.status == 200
+        assert handler.payload() == {
+            "ok": True,
+            "enabled_toolsets": ["old-toolset"],
+        }
+        save_mock.assert_not_called()
+
+
 @pytest.mark.skipif(
     config._AGENT_DIR is None,
     reason="hermes-agent not found",
