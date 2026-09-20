@@ -772,21 +772,24 @@ def test_streaming_snapshots_session_toolsets_under_agent_lock():
     source = (Path(__file__).resolve().parents[1] / "api" / "streaming.py").read_text(
         encoding="utf-8"
     )
+    run_start = source.index("def _run_agent_streaming(")
+    run_end = source.index("\ndef ", run_start + 1)
+    run_source = source[run_start:run_end]
 
-    lock_start = source.index("with _agent_lock:")
-    snapshot_pos = source.index(
+    lock_start = run_source.index("with _agent_lock:")
+    snapshot_pos = run_source.index(
         '_session_toolsets_override = getattr(s, "enabled_toolsets", None)',
         lock_start,
     )
-    lock_end = source.index("# TD1: set thread-local env context", lock_start)
-    resolve_pos = source.index("_toolsets = _resolve_cli_toolsets(_cfg)", lock_end)
-    apply_pos = source.index(
+    lock_end = run_source.index("# TD1: set thread-local env context", lock_start)
+    resolve_pos = run_source.index("_toolsets = _resolve_cli_toolsets(_cfg)", lock_end)
+    apply_pos = run_source.index(
         "if _session_toolsets_override:",
         resolve_pos,
     )
 
     assert lock_start < snapshot_pos < lock_end < resolve_pos < apply_pos
-    region = source[resolve_pos:apply_pos + 500]
+    region = run_source[resolve_pos:apply_pos + 500]
     assert "Session.load_metadata_only(session_id)" not in region
 
 
