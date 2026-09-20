@@ -192,6 +192,7 @@ def test_toolset_change_restores_shared_session_when_sidecar_save_fails(tmp_path
         session.save(skip_index=True)
         sid = session.session_id
         sidecar = session_dir / f"{sid}.json"
+        previous_updated_at = session.updated_at
 
         calls = []
         db = Mock()
@@ -227,6 +228,7 @@ def test_toolset_change_restores_shared_session_when_sidecar_save_fails(tmp_path
         assert json.loads(sidecar.read_text())["enabled_toolsets"] == ["old-toolset"]
         assert models.SESSIONS[sid].enabled_toolsets == ["old-toolset"]
         assert models.get_session(sid).enabled_toolsets == ["old-toolset"]
+        assert session.updated_at == previous_updated_at
         assert handler.status != 200
         assert calls == [
             ("system_prompt", sid, None),
@@ -266,16 +268,10 @@ def test_toolset_change_keeps_committed_sidecar_after_index_save_fails(tmp_path)
         db.update_session_tool_names.side_effect = (
             lambda session_id, value: calls.append(("tool_names", session_id, value))
         )
-        real_safe_replace = models._safe_replace
-
-        def fail_index_replace(src, dst):
-            if Path(dst) == index_file:
-                raise OSError("session index replace failed")
-            return real_safe_replace(src, dst)
 
         with (
             patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
-            patch.object(models, "_safe_replace", side_effect=fail_index_replace),
+            patch("api.routes._write_session_index", side_effect=OSError("session index replace failed")),
             patch.dict(
                 sys.modules,
                 {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))},
@@ -285,21 +281,27 @@ def test_toolset_change_keeps_committed_sidecar_after_index_save_fails(tmp_path)
                 "session_id": sid,
                 "toolsets": ["new-toolset"],
             })
+            handle_post(handler, urlparse("/api/session/toolsets"))
 
-            with pytest.raises(OSError, match="session index replace failed"):
-                handle_post(handler, urlparse("/api/session/toolsets"))
-
+        assert handler.status == 200
+        assert handler.payload() == {
+            "ok": True,
+            "enabled_toolsets": ["new-toolset"],
+        }
         assert json.loads(sidecar.read_text())["enabled_toolsets"] == ["new-toolset"]
         assert models.SESSIONS[sid].enabled_toolsets == ["new-toolset"]
         assert models.get_session(sid).enabled_toolsets == ["new-toolset"]
         assert json.loads(index_file.read_text()) == old_index
-        assert handler.status != 200
         assert calls == [
             ("system_prompt", sid, None),
             ("tool_names", sid, None),
         ]
         db.close.assert_called_once()
 
+        # A later unrelated save must preserve the committed toolset selection.
+        session.title = "Unrelated later save"
+        session.save(skip_index=True)
+        assert json.loads(sidecar.read_text())["enabled_toolsets"] == ["new-toolset"]
 
 def test_toolset_change_is_rejected_during_active_turn(tmp_path):
     session_dir = tmp_path / "sessions"
@@ -377,6 +379,134 @@ def test_toolset_change_is_rejected_during_active_run_unwind(tmp_path):
         assert json.loads(
             (session_dir / f"{sid}.json").read_text()
         )["enabled_toolsets"] == ["old-toolset"]
+
+
+def test_toolset_route_emits_http_only_after_session_lock_is_released(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+
+        class TrackingLock:
+            held = False
+
+            def __enter__(self):
+                self.held = True
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.held = False
+                return False
+
+        lock = TrackingLock()
+
+        def assert_unlocked_j(handler, payload, status=200, **kwargs):
+            assert not lock.held
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json")
+            handler.end_headers()
+            handler.wfile.write(json.dumps(payload).encode())
+            return True
+
+        with (
+            patch("api.routes._get_session_agent_lock", return_value=lock),
+            patch("api.routes.j", side_effect=assert_unlocked_j),
+        ):
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["old-toolset"],
+            })
+            handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert handler.status == 200
+
+
+def test_toolset_change_real_active_run_registry_blocks_until_teardown(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", collections.OrderedDict()),
+    ):
+        blocked = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        other = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        blocked.save(skip_index=True)
+        other.save(skip_index=True)
+
+        blocked_sid = blocked.session_id
+        other_sid = other.session_id
+        stream_id = "real-active-run"
+
+        config.ACTIVE_RUNS.clear()
+        config.STREAMS.clear()
+        config.register_active_run(stream_id, session_id=blocked_sid, phase="running")
+
+        try:
+            blocked_handler = _DummyHandler({
+                "session_id": blocked_sid,
+                "toolsets": ["new-toolset"],
+            })
+            handle_post(blocked_handler, urlparse("/api/session/toolsets"))
+
+            assert blocked_handler.status == 409
+            assert json.loads(
+                (session_dir / f"{blocked_sid}.json").read_text()
+            )["enabled_toolsets"] == ["old-toolset"]
+
+            # A different session is not serialized behind the blocked session's
+            # lifecycle row. Use a no-op so no Hermes Agent dependency is needed.
+            other_handler = _DummyHandler({
+                "session_id": other_sid,
+                "toolsets": ["old-toolset"],
+            })
+            handle_post(other_handler, urlparse("/api/session/toolsets"))
+            assert other_handler.status == 200
+
+            config.unregister_active_run(stream_id)
+
+            # After teardown the same session is admitted. Patch only SessionDB;
+            # lifecycle predicates remain production-shaped.
+            db = Mock()
+            with (
+                patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
+                patch.dict(
+                    sys.modules,
+                    {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))},
+                ),
+            ):
+                admitted_handler = _DummyHandler({
+                    "session_id": blocked_sid,
+                    "toolsets": ["new-toolset"],
+                })
+                handle_post(admitted_handler, urlparse("/api/session/toolsets"))
+
+            assert admitted_handler.status == 200
+            assert json.loads(
+                (session_dir / f"{blocked_sid}.json").read_text()
+            )["enabled_toolsets"] == ["new-toolset"]
+        finally:
+            config.ACTIVE_RUNS.clear()
+            config.STREAMS.clear()
 
 
 def test_identical_toolset_selection_is_a_noop(tmp_path):
