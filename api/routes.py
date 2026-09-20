@@ -15988,10 +15988,20 @@ def handle_post(handler, parsed) -> bool:
                 s.enabled_toolsets = toolsets
                 s.save()
             except Exception:
-                # Session is shared through models.SESSIONS. Do not leave the
-                # in-memory object ahead of the durable sidecar after a failed
-                # atomic replace.
-                s.enabled_toolsets = previous_toolsets
+                # save() replaces the sidecar before it updates the separate
+                # session index. If the index update fails after that replace,
+                # the sidecar is authoritative and must not be rolled back in
+                # memory to a value that is no longer on disk.
+                try:
+                    persisted = Session.load(sid)
+                except Exception:
+                    persisted = None
+                if persisted is not None and persisted.enabled_toolsets == toolsets:
+                    s.enabled_toolsets = persisted.enabled_toolsets
+                else:
+                    # The sidecar was not committed; keep the shared object
+                    # aligned with the old durable selection.
+                    s.enabled_toolsets = previous_toolsets
                 raise
 
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
