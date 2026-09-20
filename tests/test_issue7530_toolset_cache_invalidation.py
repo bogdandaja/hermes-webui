@@ -368,7 +368,7 @@ def test_toolset_change_is_rejected_during_active_run_unwind(tmp_path):
                 return_value=False,
             ),
             patch(
-                "api.routes._active_run_stream_for_session",
+                "api.routes._active_run_stream_for_session_fail_closed",
                 return_value="unwinding-stream",
             ),
         ):
