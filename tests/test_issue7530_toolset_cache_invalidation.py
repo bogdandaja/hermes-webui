@@ -5,6 +5,8 @@ from __future__ import annotations
 import collections
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,6 +16,7 @@ import pytest
 
 import api.config as config
 import api.models as models
+import api.routes as routes
 from api.models import new_session
 from api.routes import handle_post
 from tests.test_issue4490_presession_toolsets import _DummyHandler
@@ -381,6 +384,55 @@ def test_toolset_change_is_rejected_during_active_run_unwind(tmp_path):
         )["enabled_toolsets"] == ["old-toolset"]
 
 
+def test_toolset_change_rejects_old_cancelled_worker_without_age_pruning(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    registry = collections.OrderedDict()
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", registry),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save(skip_index=True)
+        sid = session.session_id
+        stream_id = "delayed-cancelled-worker"
+
+        config.ACTIVE_RUNS.clear()
+        config.STREAMS.clear()
+        config.register_active_run(
+            stream_id,
+            session_id=sid,
+            phase="cancelling",
+            cancelled_at=time.time() - 600.0,
+        )
+
+        try:
+            with patch(
+                "api.routes._active_state_db_path",
+                side_effect=AssertionError("live worker must block before SessionDB"),
+            ):
+                handler = _DummyHandler({
+                    "session_id": sid,
+                    "toolsets": ["new-toolset"],
+                })
+                handle_post(handler, urlparse("/api/session/toolsets"))
+
+            assert handler.status == 409
+            assert json.loads(
+                (session_dir / f"{sid}.json").read_text()
+            )["enabled_toolsets"] == ["old-toolset"]
+            assert stream_id in config.ACTIVE_RUNS
+        finally:
+            config.unregister_active_run(stream_id)
+            config.STREAMS.clear()
+
+
 def test_toolset_route_emits_http_only_after_session_lock_is_released(tmp_path):
     session_dir = tmp_path / "sessions"
     index_file = session_dir / "_index.json"
@@ -509,6 +561,61 @@ def test_toolset_change_real_active_run_registry_blocks_until_teardown(tmp_path)
             config.STREAMS.clear()
 
 
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["b", "a"],
+        ["a", "b", "a", "b"],
+    ],
+)
+def test_semantically_identical_toolsets_are_noop_and_keep_pins(tmp_path, requested):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    registry = collections.OrderedDict()
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", registry),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["a", "b"],
+        )
+        session.save(skip_index=True)
+
+        with (
+            patch.object(session, "save") as save_mock,
+            patch(
+                "api.routes._active_state_db_path",
+                side_effect=AssertionError("semantic no-op must not open SessionDB"),
+            ),
+        ):
+            handler = _DummyHandler({
+                "session_id": session.session_id,
+                "toolsets": requested,
+            })
+            handle_post(handler, urlparse("/api/session/toolsets"))
+
+        assert handler.status == 200
+        assert handler.payload() == {
+            "ok": True,
+            "enabled_toolsets": ["a", "b"],
+        }
+        assert session.enabled_toolsets == ["a", "b"]
+        save_mock.assert_not_called()
+
+
+def test_none_and_empty_toolset_identities_remain_distinct():
+    assert routes._session_toolsets_semantic_identity(None) is None
+    assert routes._session_toolsets_semantic_identity([]) == frozenset()
+    assert (
+        routes._session_toolsets_semantic_identity(None)
+        != routes._session_toolsets_semantic_identity([])
+    )
+
+
 def test_identical_toolset_selection_is_a_noop(tmp_path):
     session_dir = tmp_path / "sessions"
     index_file = session_dir / "_index.json"
@@ -549,6 +656,138 @@ def test_identical_toolset_selection_is_a_noop(tmp_path):
             "enabled_toolsets": ["old-toolset"],
         }
         save_mock.assert_not_called()
+
+
+def test_toolset_index_refresh_stays_under_lock_against_same_sid_delete(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    registry = collections.OrderedDict()
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", registry),
+        patch.object(routes, "SESSION_DIR", session_dir),
+        patch.object(routes, "SESSION_INDEX_FILE", index_file),
+        patch.object(routes, "SESSIONS", registry),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+        )
+        session.save()
+        sid = session.session_id
+        sidecar = session_dir / f"{sid}.json"
+
+        index_entered = threading.Event()
+        allow_index = threading.Event()
+        real_write_index = models._write_session_index
+
+        def paused_index_refresh(*args, **kwargs):
+            index_entered.set()
+            assert allow_index.wait(timeout=5)
+            return real_write_index(*args, **kwargs)
+
+        db = Mock()
+        toolset_result = {}
+        delete_result = {}
+
+        def mutate_toolsets():
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["new-toolset"],
+            })
+            with (
+                patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
+                patch("api.routes._write_session_index", side_effect=paused_index_refresh),
+                patch.dict(
+                    sys.modules,
+                    {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))},
+                ),
+            ):
+                handle_post(handler, urlparse("/api/session/toolsets"))
+            toolset_result["status"] = handler.status
+
+        class DeleteHandler(_DummyHandler):
+            pass
+
+        def delete_session():
+            handler = DeleteHandler({"session_id": sid})
+            handle_post(handler, urlparse("/api/session/delete"))
+            delete_result["status"] = handler.status
+
+        safe_delete_patches = (
+            patch("api.routes._lookup_cli_session_metadata", return_value={}),
+            patch("api.routes._session_is_subagent_view_only", return_value=False),
+            patch("api.routes._is_messaging_session_id", return_value=False),
+            patch("api.routes._worktree_retained_payload_for_session_id", return_value={}),
+            patch("api.routes._publish_session_list_changed", return_value=None),
+            patch("api.config._evict_session_agent", return_value=None),
+            patch("api.models.delete_cli_session", return_value=True),
+            patch("api.upload._session_attachment_dir", return_value=tmp_path / "attachments" / sid),
+            patch("api.turn_journal.delete_turn_journal", return_value=None),
+            patch("api.run_journal.delete_run_journal", return_value=None),
+            patch("api.background_process.forget_bg_task_completion_dedup", return_value=None),
+            patch("api.terminal.close_terminal", return_value=None),
+        )
+
+        for p in safe_delete_patches:
+            p.start()
+        try:
+            toolset_thread = threading.Thread(target=mutate_toolsets)
+            toolset_thread.start()
+            assert index_entered.wait(timeout=5)
+
+            delete_thread = threading.Thread(target=delete_session)
+            delete_thread.start()
+            delete_thread.join(timeout=0.2)
+            assert delete_thread.is_alive(), (
+                "same-SID delete must wait while toolset index refresh holds session lock"
+            )
+
+            allow_index.set()
+            toolset_thread.join(timeout=5)
+            delete_thread.join(timeout=5)
+
+            assert toolset_result["status"] == 200
+            assert delete_result["status"] == 200
+            assert not sidecar.exists()
+            assert sid not in registry
+            assert sid in models._load_webui_deleted_session_tombstone()
+
+            raw_index = json.loads(index_file.read_text()) if index_file.exists() else []
+            assert all(row.get("session_id") != sid for row in raw_index)
+
+            registry.clear()
+            cold = models.all_sessions()
+            assert all(row.get("session_id") != sid for row in cold)
+        finally:
+            allow_index.set()
+            for p in reversed(safe_delete_patches):
+                p.stop()
+
+
+def test_streaming_snapshots_session_toolsets_under_agent_lock():
+    source = (Path(__file__).resolve().parents[1] / "api" / "streaming.py").read_text(
+        encoding="utf-8"
+    )
+
+    lock_start = source.index("with _agent_lock:")
+    snapshot_pos = source.index(
+        '_session_toolsets_override = getattr(s, "enabled_toolsets", None)',
+        lock_start,
+    )
+    lock_end = source.index("# TD1: set thread-local env context", lock_start)
+    resolve_pos = source.index("_toolsets = _resolve_cli_toolsets(_cfg)", lock_end)
+    apply_pos = source.index(
+        "if _session_toolsets_override:",
+        resolve_pos,
+    )
+
+    assert lock_start < snapshot_pos < lock_end < resolve_pos < apply_pos
+    region = source[resolve_pos:apply_pos + 500]
+    assert "Session.load_metadata_only(session_id)" not in region
 
 
 @pytest.mark.skipif(
