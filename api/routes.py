@@ -15950,61 +15950,73 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        with _get_session_agent_lock(sid):
-            # A no-op must not evict Agent caches or rewrite the sidecar.
-            if s.enabled_toolsets == toolsets:
-                return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
 
-            # A live or unwinding worker can restore the old Agent pins after
-            # this route returns. Reject the change instead of reporting a
-            # success that the next turn would silently undo.
-            if (
+        outcome = "changed"
+        response_toolsets = None
+
+        with _get_session_agent_lock(sid):
+            # Compute lock-local admission/mutation only. HTTP response helpers
+            # are intentionally called after the lock is released.
+            if s.enabled_toolsets == toolsets:
+                outcome = "unchanged"
+                response_toolsets = s.enabled_toolsets
+            elif (
                 _active_stream_blocks_chat_start(
                     s, getattr(s, "active_stream_id", None)
                 )
                 or _active_run_stream_for_session(sid)
             ):
-                return bad(
-                    handler,
-                    "Cannot change session toolsets during an active turn",
-                    409,
+                outcome = "busy"
+            else:
+                # Invalidate Hermes' persisted Agent cache pins before making the
+                # new WebUI toolset override durable. This keeps failures fail-closed:
+                # the old toolset remains authoritative until both invalidations
+                # have completed successfully.
+                from hermes_state import SessionDB
+
+                _state_db = SessionDB(_active_state_db_path())
+                try:
+                    _state_db.update_system_prompt(sid, None)
+                    _state_db.update_session_tool_names(sid, None)
+                finally:
+                    _state_db.close()
+
+                # The sidecar replacement is the transaction commit boundary.
+                # Keep the sidebar index out of this critical commit so an
+                # index-only failure cannot turn a durable toolset change into
+                # a failed API transaction.
+                previous_toolsets = s.enabled_toolsets
+                previous_updated_at = s.updated_at
+                s.enabled_toolsets = toolsets
+                try:
+                    s.save(skip_index=True)
+                except Exception:
+                    s.enabled_toolsets = previous_toolsets
+                    s.updated_at = previous_updated_at
+                    raise
+
+                response_toolsets = s.enabled_toolsets
+
+        if outcome == "busy":
+            return bad(
+                handler,
+                "Cannot change session toolsets during an active turn",
+                409,
+            )
+
+        if outcome == "changed":
+            # The sidecar is already authoritative. Index refresh is repairable
+            # metadata and must not make the successful mutation look rejected.
+            try:
+                _write_session_index(updates=[s])
+            except Exception:
+                logger.warning(
+                    "Toolset change for session %s committed, but session index refresh failed",
+                    sid,
+                    exc_info=True,
                 )
 
-            # Invalidate Hermes' persisted Agent cache pins before making the
-            # new WebUI toolset override durable. This keeps failures fail-closed:
-            # the old toolset remains authoritative until both invalidations
-            # have completed successfully.
-            from hermes_state import SessionDB
-
-            _state_db = SessionDB(_active_state_db_path())
-            try:
-                _state_db.update_system_prompt(sid, None)
-                _state_db.update_session_tool_names(sid, None)
-            finally:
-                _state_db.close()
-
-            previous_toolsets = s.enabled_toolsets
-            try:
-                s.enabled_toolsets = toolsets
-                s.save()
-            except Exception:
-                # save() replaces the sidecar before it updates the separate
-                # session index. If the index update fails after that replace,
-                # the sidecar is authoritative and must not be rolled back in
-                # memory to a value that is no longer on disk.
-                try:
-                    persisted = Session.load(sid)
-                except Exception:
-                    persisted = None
-                if persisted is not None and persisted.enabled_toolsets == toolsets:
-                    s.enabled_toolsets = persisted.enabled_toolsets
-                else:
-                    # The sidecar was not committed; keep the shared object
-                    # aligned with the old durable selection.
-                    s.enabled_toolsets = previous_toolsets
-                raise
-
-        return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
+        return j(handler, {"ok": True, "enabled_toolsets": response_toolsets})
 
     if parsed.path == "/api/session/draft":
         # GET ?session_id=X  → return current draft
