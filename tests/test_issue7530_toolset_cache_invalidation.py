@@ -658,6 +658,130 @@ def test_identical_toolset_selection_is_a_noop(tmp_path):
         save_mock.assert_not_called()
 
 
+def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
+    session_dir = tmp_path / "sessions"
+    index_file = session_dir / "_index.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    registry = collections.OrderedDict()
+
+    with (
+        patch.object(models, "SESSION_DIR", session_dir),
+        patch.object(models, "SESSION_INDEX_FILE", index_file),
+        patch.object(models, "SESSIONS", registry),
+        patch.object(routes, "SESSION_DIR", session_dir),
+        patch.object(routes, "SESSION_INDEX_FILE", index_file),
+        patch.object(routes, "SESSIONS", registry),
+    ):
+        session = new_session(
+            workspace=str(tmp_path),
+            enabled_toolsets=["old-toolset"],
+            messages=[{"role": "user", "content": "keep tombstone"}],
+        )
+        session.save()
+        sid = session.session_id
+        sidecar = session_dir / f"{sid}.json"
+
+        first_lookup_done = threading.Event()
+        allow_lock = threading.Event()
+        real_get_session = routes.get_session
+        real_lock_getter = routes._get_session_agent_lock
+        lookup_calls = {"count": 0}
+
+        def staged_get_session(target_sid, *args, **kwargs):
+            value = real_get_session(target_sid, *args, **kwargs)
+            if target_sid == sid:
+                lookup_calls["count"] += 1
+                if lookup_calls["count"] == 1:
+                    first_lookup_done.set()
+            return value
+
+        class GateLock:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                assert allow_lock.wait(timeout=5)
+                self.inner.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.inner.release()
+                return False
+
+        def gated_lock(target_sid):
+            return GateLock(real_lock_getter(target_sid))
+
+        db = Mock()
+        update_result = {}
+        delete_result = {}
+
+        def mutate():
+            handler = _DummyHandler({
+                "session_id": sid,
+                "toolsets": ["new-toolset"],
+            })
+            with (
+                patch("api.routes.get_session", side_effect=staged_get_session),
+                patch("api.routes._get_session_agent_lock", side_effect=gated_lock),
+                patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
+                patch.dict(
+                    sys.modules,
+                    {"hermes_state": SimpleNamespace(SessionDB=Mock(return_value=db))},
+                ),
+            ):
+                handle_post(handler, urlparse("/api/session/toolsets"))
+            update_result["status"] = handler.status
+
+        safe_delete_patches = (
+            patch("api.routes._lookup_cli_session_metadata", return_value={}),
+            patch("api.routes._session_is_subagent_view_only", return_value=False),
+            patch("api.routes._is_messaging_session_id", return_value=False),
+            patch("api.routes._worktree_retained_payload_for_session_id", return_value={}),
+            patch("api.routes._publish_session_list_changed", return_value=None),
+            patch("api.config._evict_session_agent", return_value=None),
+            patch("api.models.delete_cli_session", return_value=True),
+            patch("api.upload._session_attachment_dir", return_value=tmp_path / "attachments" / sid),
+            patch("api.turn_journal.delete_turn_journal", return_value=None),
+            patch("api.run_journal.delete_run_journal", return_value=None),
+            patch("api.background_process.forget_bg_task_completion_dedup", return_value=None),
+            patch("api.terminal.close_terminal", return_value=None),
+        )
+        for p in safe_delete_patches:
+            p.start()
+
+        try:
+            update_thread = threading.Thread(target=mutate)
+            update_thread.start()
+            assert first_lookup_done.wait(timeout=5)
+
+            # Delete wins the real per-SID lock before the waiting update is
+            # allowed to acquire it.
+            delete_handler = _DummyHandler({"session_id": sid})
+            handle_post(delete_handler, urlparse("/api/session/delete"))
+            delete_result["status"] = delete_handler.status
+            assert delete_result["status"] == 200
+            assert not sidecar.exists()
+            assert sid not in registry
+            assert sid in models._load_webui_deleted_session_tombstone()
+
+            allow_lock.set()
+            update_thread.join(timeout=5)
+
+            assert update_result["status"] == 404
+            assert not sidecar.exists()
+            assert sid not in registry
+            assert sid in models._load_webui_deleted_session_tombstone()
+
+            raw_index = json.loads(index_file.read_text()) if index_file.exists() else []
+            assert all(row.get("session_id") != sid for row in raw_index)
+            db.update_system_prompt.assert_not_called()
+            db.update_session_tool_names.assert_not_called()
+        finally:
+            allow_lock.set()
+            for p in reversed(safe_delete_patches):
+                p.stop()
+
+
 def test_toolset_index_refresh_stays_under_lock_against_same_sid_delete(tmp_path):
     session_dir = tmp_path / "sessions"
     index_file = session_dir / "_index.json"
