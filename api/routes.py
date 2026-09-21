@@ -15954,7 +15954,9 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e), status=400)
         try:
-            s = get_session(sid)
+            # Fast pre-lock existence check only. Never mutate this object after
+            # waiting for the per-session lock; delete may win in that window.
+            get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
 
@@ -15963,9 +15965,24 @@ def handle_post(handler, parsed) -> bool:
         index_refresh_error = None
 
         with _get_session_agent_lock(sid):
+            # Re-resolve the canonical live session after acquiring the lock.
+            # A same-SID delete may have completed while this request waited;
+            # fail closed instead of resurrecting its stale pre-lock object.
+            if sid in _load_webui_deleted_session_tombstone():
+                outcome = "missing"
+                s = None
+            else:
+                try:
+                    s = get_session(sid)
+                except KeyError:
+                    outcome = "missing"
+                    s = None
+
             # Compute lock-local admission/mutation only. HTTP response helpers
             # are intentionally called after the lock is released.
-            if (
+            if outcome == "missing":
+                pass
+            elif (
                 _session_toolsets_semantic_identity(s.enabled_toolsets)
                 == _session_toolsets_semantic_identity(toolsets)
             ):
@@ -16014,6 +16031,9 @@ def handle_post(handler, parsed) -> bool:
                     _write_session_index(updates=[s])
                 except Exception as exc:
                     index_refresh_error = exc
+
+        if outcome == "missing":
+            return bad(handler, "Session not found", 404)
 
         if index_refresh_error is not None:
             logger.warning(
