@@ -15953,21 +15953,15 @@ def handle_post(handler, parsed) -> bool:
             toolsets = _validate_session_toolsets_shape(toolsets)
         except ValueError as e:
             return bad(handler, str(e), status=400)
-        try:
-            # Fast pre-lock existence check only. Never mutate this object after
-            # waiting for the per-session lock; delete may win in that window.
-            get_session(sid)
-        except KeyError:
-            return bad(handler, "Session not found", 404)
-
         outcome = "changed"
         response_toolsets = None
         index_refresh_error = None
 
         with _get_session_agent_lock(sid):
-            # Re-resolve the canonical live session after acquiring the lock.
-            # A same-SID delete may have completed while this request waited;
-            # fail closed instead of resurrecting its stale pre-lock object.
+            # Resolve the canonical live session only after acquiring the
+            # per-SID mutation lock. get_session() can cold-load a sidecar and
+            # publish it into SESSIONS, so even an apparent pre-lock existence
+            # check would race a same-SID delete and could resurrect the cache.
             if sid in _load_webui_deleted_session_tombstone():
                 outcome = "missing"
                 s = None
