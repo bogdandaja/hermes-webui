@@ -658,7 +658,7 @@ def test_identical_toolset_selection_is_a_noop(tmp_path):
         save_mock.assert_not_called()
 
 
-def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
+def test_toolset_update_cold_cache_never_loads_before_session_lock(tmp_path):
     session_dir = tmp_path / "sessions"
     index_file = session_dir / "_index.json"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -681,35 +681,33 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
         sid = session.session_id
         sidecar = session_dir / f"{sid}.json"
 
-        first_lookup_done = threading.Event()
-        allow_lock = threading.Event()
-        real_get_session = routes.get_session
-        real_lock_getter = routes._get_session_agent_lock
-        lookup_calls = {"count": 0}
+        # Force the route through the real cold-cache path.
+        registry.clear()
 
-        def staged_get_session(target_sid, *args, **kwargs):
-            value = real_get_session(target_sid, *args, **kwargs)
+        update_waiting_for_lock = threading.Event()
+        allow_update_lock = threading.Event()
+        real_lock_getter = routes._get_session_agent_lock
+        real_session_load = models.Session.load
+        load_started = threading.Event()
+
+        def observed_load(target_sid):
             if target_sid == sid:
-                lookup_calls["count"] += 1
-                if lookup_calls["count"] == 1:
-                    first_lookup_done.set()
-            return value
+                load_started.set()
+            return real_session_load(target_sid)
 
         class GateLock:
             def __init__(self, inner):
                 self.inner = inner
 
             def acquire(self, *args, **kwargs):
-                # /api/session/delete acquires the per-SID lock explicitly
-                # with a timeout. Delegate transparently so delete can win
-                # while the update is paused before its context-manager acquire.
                 return self.inner.acquire(*args, **kwargs)
 
             def release(self):
                 return self.inner.release()
 
             def __enter__(self):
-                assert allow_lock.wait(timeout=5)
+                update_waiting_for_lock.set()
+                assert allow_update_lock.wait(timeout=5)
                 self.inner.acquire()
                 return self
 
@@ -722,7 +720,6 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
 
         db = Mock()
         update_result = {}
-        delete_result = {}
 
         def mutate():
             handler = _DummyHandler({
@@ -730,8 +727,8 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
                 "toolsets": ["new-toolset"],
             })
             with (
-                patch("api.routes.get_session", side_effect=staged_get_session),
                 patch("api.routes._get_session_agent_lock", side_effect=gated_lock),
+                patch.object(models.Session, "load", side_effect=observed_load),
                 patch("api.routes._active_state_db_path", return_value=tmp_path / "state.db"),
                 patch.dict(
                     sys.modules,
@@ -761,19 +758,23 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
         try:
             update_thread = threading.Thread(target=mutate)
             update_thread.start()
-            assert first_lookup_done.wait(timeout=5)
+            assert update_waiting_for_lock.wait(timeout=5)
 
-            # Delete wins the real per-SID lock before the waiting update is
-            # allowed to acquire it.
+            # The corrected route has not touched get_session()/Session.load yet.
+            # On the buggy pre-lock implementation, a cold lookup would already
+            # have started loading the sidecar before reaching this barrier.
+            assert not load_started.is_set()
+            assert sid not in registry
+
+            # Delete wins the real per-SID lock and completes while update waits.
             delete_handler = _DummyHandler({"session_id": sid})
             handle_post(delete_handler, urlparse("/api/session/delete"))
-            delete_result["status"] = delete_handler.status
-            assert delete_result["status"] == 200
+            assert delete_handler.status == 200
             assert not sidecar.exists()
             assert sid not in registry
             assert sid in models._load_webui_deleted_session_tombstone()
 
-            allow_lock.set()
+            allow_update_lock.set()
             update_thread.join(timeout=5)
 
             assert update_result["status"] == 404
@@ -783,10 +784,15 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
 
             raw_index = json.loads(index_file.read_text()) if index_file.exists() else []
             assert all(row.get("session_id") != sid for row in raw_index)
+
+            registry.clear()
+            cold_listing = models.all_sessions()
+            assert all(row.get("session_id") != sid for row in cold_listing)
+
             db.update_system_prompt.assert_not_called()
             db.update_session_tool_names.assert_not_called()
         finally:
-            allow_lock.set()
+            allow_update_lock.set()
             for p in reversed(safe_delete_patches):
                 p.stop()
 
