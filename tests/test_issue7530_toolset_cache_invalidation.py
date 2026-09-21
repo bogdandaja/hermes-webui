@@ -699,6 +699,15 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
             def __init__(self, inner):
                 self.inner = inner
 
+            def acquire(self, *args, **kwargs):
+                # /api/session/delete acquires the per-SID lock explicitly
+                # with a timeout. Delegate transparently so delete can win
+                # while the update is paused before its context-manager acquire.
+                return self.inner.acquire(*args, **kwargs)
+
+            def release(self):
+                return self.inner.release()
+
             def __enter__(self):
                 assert allow_lock.wait(timeout=5)
                 self.inner.acquire()
