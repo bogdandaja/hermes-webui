@@ -675,8 +675,8 @@ def test_toolset_update_revalidates_after_delete_wins_before_lock(tmp_path):
         session = new_session(
             workspace=str(tmp_path),
             enabled_toolsets=["old-toolset"],
-            messages=[{"role": "user", "content": "keep tombstone"}],
         )
+        session.messages = [{"role": "user", "content": "keep tombstone"}]
         session.save()
         sid = session.session_id
         sidecar = session_dir / f"{sid}.json"
